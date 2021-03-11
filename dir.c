@@ -1035,6 +1035,9 @@ static int add_patterns_from_buffer(char *buf, size_t size,
 				    const char *base, int baselen,
 				    struct pattern_list *pl);
 
+/* Flags for add_patterns() */
+#define PATTERN_NOFOLLOW (1<<0)
+
 /*
  * Given a file with name "fname", read it (either from disk, or from
  * an index if 'istate' is non-null), parse it and store the
@@ -1046,7 +1049,7 @@ static int add_patterns_from_buffer(char *buf, size_t size,
  */
 static int add_patterns(const char *fname, const char *base, int baselen,
 			struct pattern_list *pl, struct index_state *istate,
-			struct oid_stat *oid_stat)
+			unsigned flags, struct oid_stat *oid_stat)
 {
 	struct stat st;
 	int r;
@@ -1054,12 +1057,59 @@ static int add_patterns(const char *fname, const char *base, int baselen,
 	size_t size = 0;
 	char *buf;
 
-	fd = open(fname, O_RDONLY);
-	if (fd < 0 || fstat(fd, &st) < 0) {
-		if (fd < 0)
-			warn_on_fopen_errors(fname);
+	/*
+	 * A performance optimization for status.
+	 *
+	 * During a status scan, git looks in each directory for a .gitignore
+	 * file before scanning the directory.  Since .gitignore files are not
+	 * that common, we can waste a lot of time looking for files that are
+	 * not there.  Fortunately, the fscache already knows if the directory
+	 * contains a .gitignore file, since it has already read the directory
+	 * and it already has the stat-data.
+	 *
+	 * If the fscache is enabled, use the fscache-lstat() interlude to see
+	 * if the file exists (in the fscache hash maps) before trying to open()
+	 * it.
+	 *
+	 * This causes problem when the .gitignore file is a symlink, because
+	 * we call lstat() rather than stat() on the symlnk and the resulting
+	 * stat-data is for the symlink itself rather than the target file.
+	 * We CANNOT use stat() here because the fscache DOES NOT install an
+	 * interlude for stat() and mingw_stat() always calls "open-fstat-close"
+	 * on the file and defeats the purpose of the optimization here.  Since
+	 * symlinks are even more rare than .gitignore files, we force a fstat()
+	 * after our open() to get stat-data for the target file.
+	 */
+	if (is_fscache_enabled(fname)) {
+		if (lstat(fname, &st) < 0) {
+			fd = -1;
+		} else {
+			fd = open(fname, O_RDONLY);
+			if (fd < 0)
+				warn_on_fopen_errors(fname);
+			else if (S_ISLNK(st.st_mode) && fstat(fd, &st) < 0) {
+				warn_on_fopen_errors(fname);
+				close(fd);
+				fd = -1;
+			}
+		}
+	} else {
+		if (flags & PATTERN_NOFOLLOW)
+			fd = open_nofollow(fname, O_RDONLY);
 		else
-			close(fd);
+			fd = open(fname, O_RDONLY);
+
+		if (fd < 0 || fstat(fd, &st) < 0) {
+			if (fd < 0)
+				warn_on_fopen_errors(fname);
+			else {
+				close(fd);
+				fd = -1;
+			}
+		}
+	}
+
+	if (fd < 0) {
 		if (!istate)
 			return -1;
 		r = read_skip_worktree_file_from_index(istate, fname,
@@ -1143,9 +1193,10 @@ static int add_patterns_from_buffer(char *buf, size_t size,
 
 int add_patterns_from_file_to_list(const char *fname, const char *base,
 				   int baselen, struct pattern_list *pl,
-				   struct index_state *istate)
+				   struct index_state *istate,
+				   unsigned flags)
 {
-	return add_patterns(fname, base, baselen, pl, istate, NULL);
+	return add_patterns(fname, base, baselen, pl, istate, flags, NULL);
 }
 
 int add_patterns_from_blob_to_list(
@@ -1194,7 +1245,7 @@ static void add_patterns_from_file_1(struct dir_struct *dir, const char *fname,
 	if (!dir->untracked)
 		dir->unmanaged_exclude_files++;
 	pl = add_pattern_list(dir, EXC_FILE, fname);
-	if (add_patterns(fname, "", 0, pl, NULL, oid_stat) < 0)
+	if (add_patterns(fname, "", 0, pl, NULL, 0, oid_stat) < 0)
 		die(_("cannot use %s as an exclude file"), fname);
 }
 
@@ -1558,6 +1609,7 @@ static void prep_exclude(struct dir_struct *dir,
 			strbuf_addstr(&sb, dir->exclude_per_dir);
 			pl->src = strbuf_detach(&sb, NULL);
 			add_patterns(pl->src, pl->src, stk->baselen, pl, istate,
+				     PATTERN_NOFOLLOW,
 				     untracked ? &oid_stat : NULL);
 		}
 		/*
@@ -2730,11 +2782,8 @@ static struct untracked_cache_dir *validate_untracked_cache(struct dir_struct *d
 		return NULL;
 	}
 
-	if (!dir->untracked->root) {
-		const int len = sizeof(*dir->untracked->root);
-		dir->untracked->root = xmalloc(len);
-		memset(dir->untracked->root, 0, len);
-	}
+	if (!dir->untracked->root)
+		FLEX_ALLOC_STR(dir->untracked->root, name, "");
 
 	/* Validate $GIT_DIR/info/exclude and core.excludesfile */
 	root = dir->untracked->root;
@@ -2996,6 +3045,23 @@ void setup_standard_excludes(struct dir_struct *dir)
 			add_patterns_from_file_1(dir, path,
 						 dir->untracked ? &dir->ss_info_exclude : NULL);
 	}
+}
+
+char *get_sparse_checkout_filename(void)
+{
+	return git_pathdup("info/sparse-checkout");
+}
+
+int get_sparse_checkout_patterns(struct pattern_list *pl)
+{
+	int res;
+	char *sparse_filename = get_sparse_checkout_filename();
+
+	pl->use_cone_patterns = core_sparse_checkout_cone;
+	res = add_patterns_from_file_to_list(sparse_filename, "", 0, pl, NULL, 0);
+
+	free(sparse_filename);
+	return res;
 }
 
 int remove_path(const char *name)

@@ -221,7 +221,7 @@ static int add(int argc, const char **argv)
 
 	if (fetch_tags != TAGS_DEFAULT) {
 		strbuf_reset(&buf);
-		strbuf_addf(&buf, "remote.%s.tagopt", name);
+		strbuf_addf(&buf, "remote.%s.tagOpt", name);
 		git_config_set(buf.buf,
 			       fetch_tags == TAGS_SET ? "--tags" : "--no-tags");
 	}
@@ -746,7 +746,7 @@ static int mv(int argc, const char **argv)
 		}
 		if (info->push_remote_name && !strcmp(info->push_remote_name, rename.old_name)) {
 			strbuf_reset(&buf);
-			strbuf_addf(&buf, "branch.%s.pushremote", item->string);
+			strbuf_addf(&buf, "branch.%s.pushRemote", item->string);
 			git_config_set(buf.buf, rename.new_name);
 		}
 	}
@@ -1702,6 +1702,7 @@ int cmd_remote(int argc, const char **argv, const char *prefix)
 	};
 	int result;
 
+	git_config(git_default_config, NULL);
 	argc = parse_options(argc, argv, prefix, options, builtin_remote_usage,
 		PARSE_OPT_STOP_AT_NON_OPTION);
 
